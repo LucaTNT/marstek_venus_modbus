@@ -95,7 +95,11 @@ class MarstekCoordinator(DataUpdateCoordinator):
         self._last_write_times: dict = {}
         # Timestamps when a read was last started per key (for stale-read detection)
         self._read_start_times: dict = {}
-        
+        # Pending/running debounced targeted re-read tasks, keyed by affected
+        # sensor key (see `affects` in the register YAML). A new write for the
+        # same key cancels and replaces the entry here, resetting the timer.
+        self._affects_debounce_tasks: dict = {}
+
         # Connection throttling to prevent endless retry attempts after repeated failures
         self._consecutive_failures = 0
         self._max_consecutive_failures = 5
@@ -586,27 +590,63 @@ class MarstekCoordinator(DataUpdateCoordinator):
 
         return values, {"requests": 1, "block_requests": 1, "single_requests": 0, "failover_single_requests": 0}
 
-    async def _async_targeted_reread(
+    def _schedule_targeted_reread(self, affected_keys: list[str], source_key: str) -> None:
+        """Debounce targeted re-reads per affected key.
+
+        If a re-read for a given key is already pending/running (from this or
+        a previous write), cancel it and start a fresh one - this resets the
+        wait timer to zero, so a burst of writes (e.g. changing charge and
+        discharge power within the same second) collapses into a single
+        re-read anchored to the *last* write instead of one redundant cycle
+        per write. Different affected keys are debounced independently.
+
+        This does not touch the coordinator's normal poll cycle at all, which
+        keeps running on its own schedule regardless of how many writes come
+        in. That makes it a natural upper bound: if writes arrive back-to-back
+        indefinitely and keep resetting this debounce, the regular poll will
+        still pick up the real value on its own cadence.
+        """
+        for affected_key in affected_keys:
+            existing_task = self._affects_debounce_tasks.get(affected_key)
+            if existing_task is not None and not existing_task.done():
+                _LOGGER.debug(
+                    "MARSTEK DEBUG: resetting debounce timer for '%s' (superseded by write to '%s')",
+                    affected_key,
+                    source_key,
+                )
+                existing_task.cancel()
+
+            task = self.hass.async_create_task(
+                self._debounced_single_key_reread(affected_key, source_key),
+                name=f"marstek_affects_reread_{affected_key}",
+            )
+            self._affects_debounce_tasks[affected_key] = task
+
+    async def _debounced_single_key_reread(
         self,
-        affected_keys: list[str],
+        affected_key: str,
         source_key: str,
         initial_delay_seconds: float = 3.5,
         max_attempts: int = 5,
         retry_delay_seconds: float = 0.5,
     ) -> None:
-        """Re-read only the given keys directly via a single-register read,
+        """Re-read a single affected key directly via a single-register read,
         instead of triggering a full coordinator poll cycle.
 
         This is used after a write whose definition declares an `affects` list
         (e.g. set_charge_power -> ac_power). Measured device ramp time is ~3.5-4s,
-        so this waits `initial_delay_seconds` (default 3s) before the first read,
-        then retries every `retry_delay_seconds` (default 0.5s) up to
-        `max_attempts` times (default 5, i.e. covering roughly 3.0s-5.0s after the
-        write), stopping early as soon as the value actually changes. Only the
-        affected register(s) are touched - every other sensor keeps its normal
-        scan_interval untouched.
+        so this waits `initial_delay_seconds` (default 3.5s) before the first
+        read, then retries every `retry_delay_seconds` (default 0.5s) up to
+        `max_attempts` times, stopping early as soon as the value actually
+        changes. Only the affected register is touched - every other sensor
+        keeps its normal scan_interval untouched.
+
+        Scheduled and debounced via `_schedule_targeted_reread` - if a newer
+        write for the same key arrives while this is running, this task gets
+        cancelled and a fresh one takes over, so we handle CancelledError
+        quietly instead of logging it as a failure.
         """
-        for affected_key in affected_keys:
+        try:
             sensor_def = next(
                 (s for s in self._all_definitions if s.get("key") == affected_key), None
             )
@@ -616,7 +656,7 @@ class MarstekCoordinator(DataUpdateCoordinator):
                     affected_key,
                     source_key,
                 )
-                continue
+                return
 
             old_value = self.data.get(affected_key) if isinstance(self.data, dict) else None
             new_value = None
@@ -676,6 +716,17 @@ class MarstekCoordinator(DataUpdateCoordinator):
                 # Push the updated value to all listening entities without
                 # running a full poll cycle.
                 self.async_set_updated_data(self.data)
+        except asyncio.CancelledError:
+            _LOGGER.debug(
+                "MARSTEK DEBUG: debounced re-read of '%s' cancelled - superseded by a newer write",
+                affected_key,
+            )
+            raise
+        finally:
+            # Only clear the registry entry if it still points at *this* task -
+            # a newer write may already have replaced it with its own task.
+            if self._affects_debounce_tasks.get(affected_key) is asyncio.current_task():
+                self._affects_debounce_tasks.pop(affected_key, None)
 
     async def async_write_value(
         self,
@@ -770,23 +821,26 @@ class MarstekCoordinator(DataUpdateCoordinator):
                 # Some writes (e.g. set_charge_power/set_discharge_power) physically
                 # influence other, independently-polled sensors (e.g. ac_power) that
                 # are not part of this integration's own `dependency_keys` mechanism.
-                # If the definition declares an `affects` list, re-read *only* those
-                # specific registers directly (not a full coordinator poll cycle),
-                # retrying a few times to catch the device's real reaction time.
+                # If the definition declares an `affects` list, schedule a debounced
+                # re-read of *only* those specific registers (not a full coordinator
+                # poll cycle). This is fire-and-forget: it does not block the write,
+                # and a burst of writes for the same affected key coalesces into a
+                # single re-read anchored to the last one (see
+                # _schedule_targeted_reread for the debounce logic).
                 affected_keys = defn.get("affects") if defn else None
                 if affected_keys:
                     _LOGGER.debug(
-                        "MARSTEK DEBUG: write to '%s' succeeded -> targeted re-read of affected key(s) %s",
+                        "MARSTEK DEBUG: write to '%s' succeeded -> scheduling targeted re-read of affected key(s) %s",
                         key,
                         affected_keys,
                     )
                     try:
-                        await self._async_targeted_reread(affected_keys, source_key=key)
+                        self._schedule_targeted_reread(affected_keys, source_key=key)
                     except Exception as refresh_err:
                         # The write itself succeeded; a failure here should not be
                         # reported back to the entity as a failed write.
                         _LOGGER.warning(
-                            "MARSTEK DEBUG: targeted re-read of %s failed (write to '%s' still succeeded): %s",
+                            "MARSTEK DEBUG: scheduling targeted re-read of %s failed (write to '%s' still succeeded): %s",
                             affected_keys,
                             key,
                             refresh_err,
