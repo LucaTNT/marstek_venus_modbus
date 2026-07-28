@@ -586,6 +586,97 @@ class MarstekCoordinator(DataUpdateCoordinator):
 
         return values, {"requests": 1, "block_requests": 1, "single_requests": 0, "failover_single_requests": 0}
 
+    async def _async_targeted_reread(
+        self,
+        affected_keys: list[str],
+        source_key: str,
+        initial_delay_seconds: float = 3.5,
+        max_attempts: int = 5,
+        retry_delay_seconds: float = 0.5,
+    ) -> None:
+        """Re-read only the given keys directly via a single-register read,
+        instead of triggering a full coordinator poll cycle.
+
+        This is used after a write whose definition declares an `affects` list
+        (e.g. set_charge_power -> ac_power). Measured device ramp time is ~3.5-4s,
+        so this waits `initial_delay_seconds` (default 3s) before the first read,
+        then retries every `retry_delay_seconds` (default 0.5s) up to
+        `max_attempts` times (default 5, i.e. covering roughly 3.0s-5.0s after the
+        write), stopping early as soon as the value actually changes. Only the
+        affected register(s) are touched - every other sensor keeps its normal
+        scan_interval untouched.
+        """
+        for affected_key in affected_keys:
+            sensor_def = next(
+                (s for s in self._all_definitions if s.get("key") == affected_key), None
+            )
+            if not sensor_def:
+                _LOGGER.warning(
+                    "MARSTEK DEBUG: no definition found for affected key '%s' (source write '%s'), skipping",
+                    affected_key,
+                    source_key,
+                )
+                continue
+
+            old_value = self.data.get(affected_key) if isinstance(self.data, dict) else None
+            new_value = None
+
+            # Give the device time to actually start ramping before the first read.
+            await asyncio.sleep(initial_delay_seconds)
+
+            for attempt in range(1, max_attempts + 1):
+                new_value = await self.async_read_value(sensor_def, affected_key, track_failure=False)
+                _LOGGER.info(
+                    "MARSTEK DEBUG: targeted re-read attempt %d/%d for '%s' (source write '%s'), "
+                    "t=+%.1fs: old=%s new=%s",
+                    attempt,
+                    max_attempts,
+                    affected_key,
+                    source_key,
+                    initial_delay_seconds + (attempt - 1) * retry_delay_seconds,
+                    old_value,
+                    new_value,
+                )
+                if new_value is not None and new_value != old_value:
+                    _LOGGER.info(
+                        "MARSTEK DEBUG: SUCCESS - '%s' changed on attempt %d/%d (t=+%.1fs after write to '%s'): "
+                        "old=%s new=%s",
+                        affected_key,
+                        attempt,
+                        max_attempts,
+                        initial_delay_seconds + (attempt - 1) * retry_delay_seconds,
+                        source_key,
+                        old_value,
+                        new_value,
+                    )
+                    break
+                if attempt < max_attempts:
+                    await asyncio.sleep(retry_delay_seconds)
+            else:
+                _LOGGER.info(
+                    "MARSTEK DEBUG: NO CHANGE - '%s' still unchanged after %d targeted attempts (%.1fs total, "
+                    "source write '%s') - device may need more time, will pick up the real value on its next "
+                    "normal poll",
+                    affected_key,
+                    max_attempts,
+                    initial_delay_seconds + (max_attempts - 1) * retry_delay_seconds,
+                    source_key,
+                )
+
+            if new_value is not None:
+                if not isinstance(self.data, dict):
+                    self.data = {}
+                self.data[affected_key] = new_value
+
+                # Keep bookkeeping consistent so the normal poll cycle doesn't
+                # immediately re-read this key again ahead of its own schedule.
+                from homeassistant.util.dt import utcnow as _utcnow3
+                self._last_attempt_times[affected_key] = _utcnow3()
+
+                # Push the updated value to all listening entities without
+                # running a full poll cycle.
+                self.async_set_updated_data(self.data)
+
     async def async_write_value(
         self,
         register: int,
@@ -672,6 +763,32 @@ class MarstekCoordinator(DataUpdateCoordinator):
                 )
                 from homeassistant.util.dt import utcnow as _utcnow
                 self._last_write_times[key] = _utcnow()
+
+                # Some writes (e.g. set_charge_power/set_discharge_power) physically
+                # influence other, independently-polled sensors (e.g. ac_power) that
+                # are not part of this integration's own `dependency_keys` mechanism.
+                # If the definition declares an `affects` list, re-read *only* those
+                # specific registers directly (not a full coordinator poll cycle),
+                # retrying a few times to catch the device's real reaction time.
+                affected_keys = defn.get("affects") if defn else None
+                if affected_keys:
+                    _LOGGER.info(
+                        "MARSTEK DEBUG: write to '%s' succeeded -> targeted re-read of affected key(s) %s",
+                        key,
+                        affected_keys,
+                    )
+                    try:
+                        await self._async_targeted_reread(affected_keys, source_key=key)
+                    except Exception as refresh_err:
+                        # The write itself succeeded; a failure here should not be
+                        # reported back to the entity as a failed write.
+                        _LOGGER.warning(
+                            "MARSTEK DEBUG: targeted re-read of %s failed (write to '%s' still succeeded): %s",
+                            affected_keys,
+                            key,
+                            refresh_err,
+                        )
+
                 return True
             else:
                 _LOGGER.warning(
