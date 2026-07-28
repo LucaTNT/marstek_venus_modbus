@@ -626,7 +626,7 @@ class MarstekCoordinator(DataUpdateCoordinator):
 
             for attempt in range(1, max_attempts + 1):
                 new_value = await self.async_read_value(sensor_def, affected_key, track_failure=False)
-                _LOGGER.info(
+                _LOGGER.debug(
                     "MARSTEK DEBUG: targeted re-read attempt %d/%d for '%s' (source write '%s'), "
                     "t=+%.1fs: old=%s new=%s",
                     attempt,
@@ -638,7 +638,7 @@ class MarstekCoordinator(DataUpdateCoordinator):
                     new_value,
                 )
                 if new_value is not None and new_value != old_value:
-                    _LOGGER.info(
+                    _LOGGER.debug(
                         "MARSTEK DEBUG: SUCCESS - '%s' changed on attempt %d/%d (t=+%.1fs after write to '%s'): "
                         "old=%s new=%s",
                         affected_key,
@@ -653,7 +653,7 @@ class MarstekCoordinator(DataUpdateCoordinator):
                 if attempt < max_attempts:
                     await asyncio.sleep(retry_delay_seconds)
             else:
-                _LOGGER.info(
+                _LOGGER.debug(
                     "MARSTEK DEBUG: NO CHANGE - '%s' still unchanged after %d targeted attempts (%.1fs total, "
                     "source write '%s') - device may need more time, will pick up the real value on its next "
                     "normal poll",
@@ -708,6 +708,9 @@ class MarstekCoordinator(DataUpdateCoordinator):
             if not defn:
                 # fallback to switches/selects if user configured writes elsewhere
                 defn = next((d for d in self.SWITCH_DEFINITIONS if d.get("key") == key), None)
+            if not defn:
+                # selects (e.g. force_mode, user_work_mode) can also declare `affects`
+                defn = next((d for d in self.SELECT_DEFINITIONS if d.get("key") == key), None)
             if defn:
                 data_type = defn.get("data_type")
         except Exception:
@@ -772,7 +775,7 @@ class MarstekCoordinator(DataUpdateCoordinator):
                 # retrying a few times to catch the device's real reaction time.
                 affected_keys = defn.get("affects") if defn else None
                 if affected_keys:
-                    _LOGGER.info(
+                    _LOGGER.debug(
                         "MARSTEK DEBUG: write to '%s' succeeded -> targeted re-read of affected key(s) %s",
                         key,
                         affected_keys,
